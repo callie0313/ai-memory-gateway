@@ -384,10 +384,12 @@ async def build_partitioned_messages(
         print(f"🔄 轮转完成(共{rotation_count}次): 摘要{len(summary_parts)}段/{summary_total}字, A区{len(a_msgs)}条, B区{len(b_msgs)}条")
     
     # 拼装messages
-    result = [{
-        "role": "system",
-        "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral"}}]
-    }]
+    result = []
+    if base_prompt:
+        result.append({
+            "role": "system",
+            "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral"}}]
+        })
     
     # 摘要区（多block，尾部追加模式）
     if summary_parts:
@@ -446,10 +448,12 @@ async def _build_basic_cached(
     current_user_msg: dict,
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
-    result = [{
-        "role": "system",
-        "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral"}}]
-    }]
+    result = []
+    if base_prompt:
+        result.append({
+            "role": "system",
+            "content": [{"type": "text", "text": base_prompt, "cache_control": {"type": "ephemeral"}}]
+        })
     
     for i, msg in enumerate(history):
         m = {k: v for k, v in msg.items() if k not in ('created_at',)}
@@ -749,7 +753,7 @@ async def chat_completions(request: Request):
     session_id = str(uuid.uuid4())[:8]
     
     # ---------- 分区缓存模式 ----------
-    if CACHE_PARTITION_ENABLED and SYSTEM_PROMPT:
+    if CACHE_PARTITION_ENABLED:
         active_sid = get_active_session_id()
         if active_sid:
             session_id = active_sid
