@@ -934,9 +934,21 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             upstream_ct = response.headers.get("content-type", "")
             print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
             
+            # 上游非200时，提前打印messages结构方便debug
+            if response.status_code != 200:
+                msg_summary = [{"role": m.get("role"), "tool_calls": bool(m.get("tool_calls")), "tool_call_id": m.get("tool_call_id", ""), "content_type": type(m.get("content")).__name__} for m in body.get("messages", [])]
+                print(f"❌ 发送的messages结构({len(msg_summary)}条): {msg_summary}", flush=True)
+            
+            error_body_parts = []
+            is_error = response.status_code != 200
+            
             async for chunk in response.aiter_bytes():
                 # 原始字节直接透传给客户端
                 yield chunk
+                
+                if is_error:
+                    error_body_parts.append(chunk)
+                    continue
                 
                 # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
                 text = chunk.decode("utf-8", errors="ignore")
@@ -980,6 +992,11 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     
     assistant_msg = "".join(full_response)
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+    
+    # 打印上游错误内容
+    if error_body_parts:
+        error_text = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
+        print(f"❌ 上游错误内容: {error_text}", flush=True)
     
     if assistant_tool_calls:
         print(f"🔧 Stream response 包含 {len(assistant_tool_calls)} 个工具调用")
