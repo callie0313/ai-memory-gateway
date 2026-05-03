@@ -531,6 +531,12 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
     global _round_counter
     
     try:
+        # Debug: 打印存储分支判断依据
+        print(f"💾 process_memories_background: user_msg={bool(user_msg)}, tool_messages={len(tool_messages) if tool_messages else 0}, "
+              f"assistant_tool_calls={len(assistant_tool_calls) if assistant_tool_calls else 0}, skip={skip_conversation_log}")
+        if tool_messages:
+            print(f"💾 tool详情: {[{'role': m.get('role'), 'tool_call_id': m.get('tool_call_id', '?')} for m in tool_messages]}")
+        
         # 1. 存储对话记录（除非明确跳过）
         if skip_conversation_log:
             print(f"⏭️  跳过对话存储（辅助请求）")
@@ -760,20 +766,50 @@ async def chat_completions(request: Request):
         client_new_msgs = [m for m in messages if m.get("role") != "system"]
         # 分区模式下，assistant消息来自上一轮response（DB里已存），过滤掉避免重复
         client_new_msgs = [m for m in client_new_msgs if m.get("role") != "assistant"]
-        # 工具结果轮次处理
-        if any(m.get("role") == "tool" for m in client_new_msgs):
-            # 检查DB历史是否已包含tool消息（上一轮已存储过）
-            db_has_recent_tool = any(m.get("role") == "tool" for m in db_msgs[-20:]) if db_msgs else False
-            if db_has_recent_tool:
-                # tool已在DB中，客户端发的是重复的，只保留新user
-                new_users = [m for m in client_new_msgs if m.get("role") == "user"]
-                client_new_msgs = [new_users[-1]] if new_users else []
-            else:
-                # tool还没存DB，保留tool + 最后的user（如果有）
-                last_msg = client_new_msgs[-1] if client_new_msgs else None
-                client_new_msgs = [m for m in client_new_msgs if m.get("role") == "tool"]
-                if last_msg and last_msg.get("role") == "user":
-                    client_new_msgs.append(last_msg)
+        # 工具结果轮次处理：用 tool_call_id 精确去重
+        client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
+        if client_tools:
+            # 收集DB中已有的 tool_call_id
+            db_tool_call_ids = set()
+            for m in db_msgs:
+                if m.get("role") == "tool" and m.get("tool_call_id"):
+                    db_tool_call_ids.add(m["tool_call_id"])
+            
+            # 分离：已存的旧tool vs 新tool
+            new_tools = [m for m in client_tools if m.get("tool_call_id") not in db_tool_call_ids]
+            old_tools = [m for m in client_tools if m.get("tool_call_id") in db_tool_call_ids]
+            
+            if old_tools:
+                print(f"🔧 去重: 过滤{len(old_tools)}条已存tool (ids: {[m.get('tool_call_id','?') for m in old_tools]})")
+            
+            # 重建 client_new_msgs：新tool + 最后的user（如果有）
+            last_msg = client_new_msgs[-1] if client_new_msgs else None
+            client_new_msgs = new_tools[:]
+            if last_msg and last_msg.get("role") == "user":
+                client_new_msgs.append(last_msg)
+            
+            if new_tools:
+                print(f"🔧 保留{len(new_tools)}条新tool (ids: {[m.get('tool_call_id','?') for m in new_tools]})")
+                
+                # Race condition 防护：如果DB里没有对应的assistant(tool_calls)，
+                # 从客户端原始消息中补充，防止孤立tool被build_partitioned_messages清洗掉
+                new_tool_ids = {m.get("tool_call_id") for m in new_tools if m.get("tool_call_id")}
+                db_has_matching_ast = False
+                for m in db_msgs:
+                    if m.get("role") == "assistant" and m.get("tool_calls"):
+                        ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
+                        if new_tool_ids & ast_tc_ids:
+                            db_has_matching_ast = True
+                            break
+                if not db_has_matching_ast and new_tool_ids:
+                    # DB还没存上一轮的assistant(tool_calls)，从客户端消息里找
+                    for m in messages:
+                        if m.get("role") == "assistant" and m.get("tool_calls"):
+                            ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
+                            if new_tool_ids & ast_tc_ids:
+                                client_new_msgs.insert(0, m)
+                                print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)，DB可能还没存完上一轮")
+                                break
         all_msgs = db_msgs + client_new_msgs
         
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
